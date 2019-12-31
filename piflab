@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+import OpenImageIO as oi
+import numpy as np
+
+fileName = "/home/mate/Work/Gradient/corpus/prep/M11-1927.000000.png"
+
+img_input = oi.ImageInput.open(fileName)
+spec = img_input.spec_dimensions(0)
+
+# Image attributes
+Width = spec.width
+Height = spec.height
+
+# Basic stats
+N_Pix = Width * Height * 3                  # Number of pixels
+N_Bits = N_Pix * 16                         # Number of raw bits
+
+print("Width: {}   Height: {}   Number of pixels: {}".format(Width, Height, N_Pix))
+pix = img_input.read_image(format="uint16")
+uni = np.unique(pix, return_counts=True)
+
+probs = uni[1] / N_Pix
+pix_entropy = - np.log2(probs)
+Entropy = np.sum(pix_entropy * uni[1])
+
+print("Unique pixel values:", len(uni[0]))
+# print(uni[0])
+# print(probs)
+# print(pix_entropy)
+
+print("Raw bits: {}   Entropy bits: {:.3f}   Ratio: {:.5f}".format(N_Bits, Entropy, Entropy / N_Bits))
+
+# Building mipmap
+u16 = np.uint16
+i16 = np.int16
+u32 = np.uint32
+i32 = np.int32
+mask = u32(1)
+w = Width
+levels = [pix,]
+
+while w > 1:
+    lower = levels[-1]
+    q1 = lower[::2,::2]
+    q2 = lower[1::2,::2]
+    q3 = lower[::2,1::2]
+    q4 = lower[1::2,1::2]
+
+    h1 = i32(q1) + q2
+    control = u16(np.bitwise_and(h1, mask))
+    h1 = np.right_shift(h1, 1)
+
+    h2 = i32(q3) + q4
+    control = np.left_shift(control, 1) + u16(np.bitwise_and(h2, mask))
+    h2 = np.right_shift(h2, 1)
+
+    higher = h1 + h2
+    control = np.left_shift(control, 1) + u16(np.bitwise_and(higher, mask))
+    higher = u16(np.right_shift(higher, 1))
+
+    print("Level", len(levels), lower[0,0,0], lower[1,0,0], lower[0,1,0], lower[1,1,0], "  Higher:", higher[0,0,0])
+
+    # Calculate differences
+    d1 = higher - u16(h1)
+    d2 = u16(h1) - q1
+    d3 = u16(h2) - q3
+
+    # Separate signs
+    control = np.left_shift(control, 1) + np.where(d1 > 32767, u16(1), u16(0))
+    d1 = np.where(d1 > 32767, -d1, d1)
+    control = np.left_shift(control, 1) + np.where(d2 > 32767, u16(1), u16(0))
+    d2 = np.where(d2 > 32767, -d2, d2)
+    control = np.left_shift(control, 1) + np.where(d3 > 32767, u16(1), u16(0))
+    d3 = np.where(d3 > 32767, -d3, d3)
+
+    lower[::2,::2] = d1
+    lower[1::2,::2] = d2
+    lower[::2,1::2] = d3
+    lower[1::2,1::2] = control
+    levels.append(higher)
+    w = w / 2
+
+bin = np.reshape(levels[0], -1)
+for l in levels[1:]:
+    bin = np.concatenate((bin, np.reshape(l, -1)))
+
+N_Mip = len(bin)
+print("Number of mipmap pixels: {}   Ratio: {:.3f}".format(N_Mip, N_Mip / N_Pix))
+MipBits = N_Mip * 16
+uni = np.unique(bin, return_counts=True)
+probs = uni[1] / N_Pix
+mip_entropy = - np.log2(probs)
+MipEntropy = np.sum(mip_entropy * uni[1])
+
+print("Unique mip values:", len(uni[0]))
+print("Raw mip bits: {}   Mip entropy bits: {:.3f}   Ratio: {:.5f}".format(MipBits, MipEntropy, MipEntropy / MipBits))
+
+print("Compressability: {:.5f}".format( MipEntropy / N_Bits ))
+
+for i, l in enumerate(levels[0:-1]):
+    print(i, l.shape, i16(l[0,0,0]), i16(l[1,0,0]), i16(l[0,1,0]), i16(l[1,1,0]))
