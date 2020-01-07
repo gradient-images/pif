@@ -2,8 +2,25 @@
 
 import OpenImageIO as oi
 import numpy as np
+import blosc
+import zstandard as zstd
 
-fileName = "/home/mate/Work/Gradient/corpus/prep/M11-1927.000000.png"
+def statistics(arr):
+    nPix = arr.size
+    nBits = nPix * 16
+    uni = np.unique(arr, return_counts=True)
+
+    probs = uni[1] / nPix
+    pixEntropy = - np.log2(probs)
+    arrEntropy = np.sum(pixEntropy * uni[1])
+
+    print("Unique pixel values:", len(uni[0]))
+    print("Raw bits: {}   Entropy bits: {:.3f}   Ratio: {:.5f}".format(nBits, arrEntropy, arrEntropy / nBits))
+
+    return arrEntropy
+
+
+fileName = "/home/mate/Work/Gradient/corpus/prep/56A3108.png"
 
 img_input = oi.ImageInput.open(fileName)
 spec = img_input.spec_dimensions(0)
@@ -12,24 +29,10 @@ spec = img_input.spec_dimensions(0)
 Width = spec.width
 Height = spec.height
 
-# Basic stats
-N_Pix = Width * Height * 3                  # Number of pixels
-N_Bits = N_Pix * 16                         # Number of raw bits
-
-print("Width: {}   Height: {}   Number of pixels: {}".format(Width, Height, N_Pix))
 pix = img_input.read_image(format="uint16")
-uni = np.unique(pix, return_counts=True)
-
-probs = uni[1] / N_Pix
-pix_entropy = - np.log2(probs)
-Entropy = np.sum(pix_entropy * uni[1])
-
-print("Unique pixel values:", len(uni[0]))
-# print(uni[0])
-# print(probs)
-# print(pix_entropy)
-
-print("Raw bits: {}   Entropy bits: {:.3f}   Ratio: {:.5f}".format(N_Bits, Entropy, Entropy / N_Bits))
+original = pix.copy()
+print("Width: {}   Height: {}   Shape: {}".format(Width, Height, Width*Height))
+statistics(pix)
 
 # Building mipmap
 u16 = np.uint16
@@ -59,12 +62,15 @@ while w > 1:
     control = np.left_shift(control, 1) + u16(np.bitwise_and(higher, mask))
     higher = u16(np.right_shift(higher, 1))
 
-    print("Level", len(levels), lower[0,0,0], lower[1,0,0], lower[0,1,0], lower[1,1,0], "  Higher:", higher[0,0,0])
+    print("Level", len(levels), lower.shape, "  Higher:", higher[0,0,0])
+    print(lower[0,0,0], lower[1,0,0], lower[0,1,0], lower[1,1,0])
 
     # Calculate differences
     d1 = higher - u16(h1)
     d2 = u16(h1) - q1
     d3 = u16(h2) - q3
+
+    print(d1[0,0,0], d2[0,0,0], d3[0,0,0], control[0,0,0])
 
     # Separate signs
     control = np.left_shift(control, 1) + np.where(d1 > 32767, u16(1), u16(0))
@@ -74,29 +80,106 @@ while w > 1:
     control = np.left_shift(control, 1) + np.where(d3 > 32767, u16(1), u16(0))
     d3 = np.where(d3 > 32767, -d3, d3)
 
+    print(d1[0,0,0], d2[0,0,0], d3[0,0,0], control[0,0,0])
+
     lower[::2,::2] = d1
     lower[1::2,::2] = d2
     lower[::2,1::2] = d3
     lower[1::2,1::2] = control
+
+    print(lower[0,0,0], lower[1,0,0], lower[0,1,0], lower[1,1,0])
+
     levels.append(higher)
     w = w / 2
 
-bin = np.reshape(levels[0], -1)
+mipmap = np.reshape(levels[0], -1)
 for l in levels[1:]:
-    bin = np.concatenate((bin, np.reshape(l, -1)))
+    mipmap = np.concatenate((mipmap, np.reshape(l, -1)))
 
-N_Mip = len(bin)
-print("Number of mipmap pixels: {}   Ratio: {:.3f}".format(N_Mip, N_Mip / N_Pix))
-MipBits = N_Mip * 16
-uni = np.unique(bin, return_counts=True)
-probs = uni[1] / N_Pix
-mip_entropy = - np.log2(probs)
-MipEntropy = np.sum(mip_entropy * uni[1])
+N_Mip = mipmap.size
+print("Number of mipmap pixels: {}   Ratio: {:.3f}".format(N_Mip, N_Mip / pix.size))
 
-print("Unique mip values:", len(uni[0]))
-print("Raw mip bits: {}   Mip entropy bits: {:.3f}   Ratio: {:.5f}".format(MipBits, MipEntropy, MipEntropy / MipBits))
+mipEntropy = statistics(mipmap)
 
-print("Compressability: {:.5f}".format( MipEntropy / N_Bits ))
+# for i, l in enumerate(levels[0:-1]):
+#     print(i, l.shape, i16(l[0,0,0]), i16(l[1,0,0]), i16(l[0,1,0]), i16(l[1,1,0]))
 
-for i, l in enumerate(levels[0:-1]):
-    print(i, l.shape, i16(l[0,0,0]), i16(l[1,0,0]), i16(l[0,1,0]), i16(l[1,1,0]))
+print("Compressability: {:.5f}".format(mipEntropy / (Width * Height * 3 * 16)))
+
+bin = mipmap.tostring()
+print("Flat: {}   Mipmap: {}".format(Width*Height*3*2, len(bin)))
+
+# blz4_packed = blosc.compress(bin, typesize=2, cname="lz4")
+# print("Blosc LZ4 mipmap: {}   Ratio: {:.5f}".format(len(blz4_packed), len(blz4_packed) / len(bin)))
+
+cctx = zstd.ZstdCompressor()
+zstd_packed = cctx.compress(bin)
+print("Zstd mipmap: {}   Ratio: {:.5f}".format(len(zstd_packed), len(zstd_packed) / len(bin)))
+
+# Reconstruct image from compressed
+print("Reconstructing image.")
+dctx = zstd.ZstdDecompressor()
+bin = dctx.decompress(zstd_packed)
+mipmap = np.frombuffer(bin, dtype=np.uint16)
+print(mipmap.shape)
+levels = []
+w = Width
+while True:
+    levelSize = w * w * 3
+    levels.append(np.reshape(mipmap[0:levelSize], (w, w, 3)).copy())
+    mipmap = mipmap[levelSize:]
+    if w == 1:
+        break
+    w = np.right_shift(w, 1)
+
+
+higher = levels[-1]
+mask = u16(1)
+
+for i in range(len(levels)-2, -1, -1):
+    lower = levels[i]
+
+    print(lower.shape, l[0,0,0])
+
+    d1 = lower[::2,::2]
+    d2 = lower[1::2,::2]
+    d3 = lower[::2,1::2]
+    control = lower[1::2,1::2]
+
+    print(d1[0,0,0], d2[0,0,0], d3[0,0,0], control[0,0,0])
+
+    # Restore signs
+    d3 = np.where(np.bitwise_and(control, mask) == 1, -d3, d3)
+    control = np.right_shift(control, 1)
+    d2 = np.where(np.bitwise_and(control, mask) == 1, -d2, d2)
+    control = np.right_shift(control, 1)
+    d1 = np.where(np.bitwise_and(control, mask) == 1, -d1, d1)
+    control = np.right_shift(control, 1)
+
+    print(d1[0,0,0], d2[0,0,0], d3[0,0,0], control[0,0,0])
+
+    h1 = u32(higher - d1)
+    h2 = np.left_shift(u32(higher), 1) - h1 + np.bitwise_and(control, mask)
+    control = np.right_shift(control, 1)
+    q3 = u16(h2 - d3)
+    q4 = u16(np.left_shift(h2, 1) - q3 + np.bitwise_and(control, mask))
+    control = np.right_shift(control, 1)
+    q1 = u16(h1 - d2)
+    q2 = u16(np.left_shift(h1, 1) - q1 + np.bitwise_and(control, mask))
+
+    # lower.setflags(write=1)
+
+    lower[::2,::2] = q1
+    lower[1::2,::2] = q2
+    lower[::2,1::2] = q3
+    lower[1::2,1::2] = q4
+
+    print(lower[0,0,0], lower[1,0,0], lower[0,1,0], lower[1,1,0])
+
+
+    higher = lower
+
+if np.array_equal(original, higher):
+    print("Succesfull reconstruction.")
+else:
+    print("Something is not right.")
